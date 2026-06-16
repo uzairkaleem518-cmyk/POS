@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "types": ["node"],  // 👈 Add this here
+    "composite": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true
+  },
+  "include": [
+    "vite.config.ts",
+    "supabase/functions/**/*"  // 👈 Make sure your Supabase code is included
+  ]
+}

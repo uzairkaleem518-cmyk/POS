@@ -1,0 +1,1764 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { Hono } from "https://deno.land/x/hono@v3.12.0/mod.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { cors } from 'npm:hono/cors';
+import { logger } from 'npm:hono/logger';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+// KV Store functions
+const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+const kv = {
+  get: async (key: string): Promise<any> => {
+    const { data, error } = await supabase.from("POS").select("value").eq("key", key).maybeSingle();
+    if (error) throw new Error(error.message);
+    return data?.value;
+  },
+  
+  set: async (key: string, value: any): Promise<void> => {
+    const { error } = await supabase.from("POS").upsert({ key, value });
+    if (error) throw new Error(error.message);
+  },
+  
+  del: async (key: string): Promise<void> => {
+    const { error } = await supabase.from('POS').delete().eq('key', key);
+    if (error) throw new Error(error.message);
+  }
+};
+
+const app = new Hono();
+
+
+const superAdminEmail = "ahmadmasoodpk0@gmail.com";
+const Roles = {
+  SUPER_ADMIN: "super_admin",
+  ADMIN: "admin",
+  MANAGER: "manager",
+  SALES_MAN: "salesman",
+};
+
+const APPROVAL_STATUS = {
+  PENDING: "pending",
+  APPROVED: "approved",
+  REJECTED: "rejected",
+};
+
+async function getAuthenticatedShop(request: Request) {
+  const accessToken = request.headers.get("Authorization")?.split(" ")[1];
+
+  if (!accessToken) {
+    return { error: "No authorization token provided", status: 401 };
+  }
+
+  const { data: { user }, error: authError } = await supabase.auth.getUser(accessToken);
+
+  if (authError || !user) {
+    return { error: "Invalid authorization token", status: 401 };
+  }
+
+  if (user.email === superAdminEmail) {
+    let shopData = await kv.get(`shop:${user.id}`);
+    if (!shopData) {
+      const superAdminShop = {
+        id: user.id,
+        shopName: "SUPER ADMIN",
+        ownerName: user.email,
+        email: user.email,
+        phone: "",
+        address: "",
+        role: Roles.SUPER_ADMIN,
+        date: new Date().toISOString(),
+      };
+      await kv.set(`shop:${user.id}`, JSON.stringify(superAdminShop));
+      shopData = JSON.stringify(superAdminShop);
+    }
+    const shop = JSON.parse(shopData);
+    shop.role = Roles.SUPER_ADMIN;
+    return { user, shop, shopId: user.id };
+  }
+
+  const userShopId = await kv.get(`user:shop:${user.id}`);
+  const shopId = userShopId || user.id;
+
+  const shopData = await kv.get(`shop:${shopId}`);
+  if (!shopData) {
+    const pendingData = await kv.get(`pending:${user.id}`);
+    if (pendingData) {
+      const pending = JSON.parse(pendingData);
+      return {
+        error: `Your account is ${pending.status}. Please wait for admin approval.`,
+        status: 403,
+        isPending: true,
+      };
+    }
+    return { error: "Shop not found for user", status: 404 };
+  }
+
+  const shop = JSON.parse(shopData);
+  if(shop.status === 'inactive'){
+     return {
+      error: "Your shop has been suspended. Please contact support or renew your subscription.",
+      status: 403,
+      isInactive: true,
+    };
+  }
+   if (shop.subscriptionEndDate) {
+    const expiryDate = new Date(shop.subscriptionEndDate);
+    const now = new Date();
+    if (expiryDate < now) {
+      return {
+        error: "Your subscription has expired. Please renew to continue using the service.",
+        status: 403,
+        isExpired: true,
+      };
+    }
+  }
+
+  if (userShopId) {
+    const userData = await kv.get(`users:${shopId}`);
+    const users = userData ? JSON.parse(userData) : [];
+    const teamMember = users.find((u: any) => u.id === user.id);
+    if (teamMember) {
+      shop.role = teamMember.role;
+    }
+  }
+
+  return { user, shop, shopId };
+}
+
+app.use('*', logger(console.log));
+app.use('*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// ==================== AUTH ROUTES ====================
+
+app.post("/make-server-a01dd888/auth/signup", async (c) => {
+  try {
+    const { email, password, shopName, ownerName, phone, address } = await c.req.json();
+    
+    if (!email || !password || !shopName || !ownerName) {
+      return c.json({ error: "Missing Required Fields" }, 400);
+    }
+    
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { shopName, ownerName, phone, address },
+    });
+    
+    if (authError) {
+      console.log("Sign Up error during user creation", authError);
+      return c.json({ error: authError.message }, 400);
+    }
+
+    const userId = authData.user.id;
+    
+    if (email === superAdminEmail) {
+      const superAdminShop = {
+        id: userId,
+        shopName: shopName || "Super Admin",
+        ownerName: ownerName || "Super Admin",
+        email,
+        phone: phone || "",
+        address: address || "",
+        role: Roles.SUPER_ADMIN,
+        createdAt: new Date().toISOString(),
+        approvedAt: new Date().toISOString(),
+      };
+
+      await kv.set(`shop:${userId}`, JSON.stringify(superAdminShop));
+      await kv.set(`products:${userId}`, JSON.stringify([]));
+      await kv.set(`customers:${userId}`, JSON.stringify([]));
+      await kv.set(`sales:${userId}`, JSON.stringify([]));
+      await kv.set(`ledger:${userId}`, JSON.stringify([]));
+      await kv.set(`users:${userId}`, JSON.stringify([]));
+      await kv.set(`suppliers:${userId}`, JSON.stringify([]));
+await kv.set(`purchases:${userId}`, JSON.stringify([]));
+
+      return c.json({
+        message: "Super Admin account created successfully! You can now sign in.",
+        status: "approved",
+        userId,
+      });
+    }
+    
+    const pendingRequest = {
+      id: userId,
+      shopName,
+      ownerName,
+      email,
+      phone: phone || "",
+      address: address || "",
+      status: APPROVAL_STATUS.PENDING,
+      role: Roles.ADMIN,
+      createdAt: new Date().toISOString(),
+      approvedAt: null,
+      approvedBy: null,
+    };
+    
+    await kv.set(`pending:${userId}`, JSON.stringify(pendingRequest));
+    
+    const pendingListData = await kv.get("pending:list");
+    const pendingList = pendingListData ? JSON.parse(pendingListData) : [];
+    pendingList.unshift(userId);
+    await kv.set("pending:list", JSON.stringify(pendingList));
+
+    return c.json({
+      message: "Registration successful! Your account is pending approval.",
+      status: "pending",
+      userId,
+    });
+  } catch (err: any) {
+    console.log("Signup error:", err);
+    return c.json({ error: "Failed to create shop account" }, 500);
+  }
+});
+
+app.post("/make-server-a01dd888/auth/signin", async (c) => {
+  try {
+    const { email, password } = await c.req.json();
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    
+    if (error) {
+      return c.json({ error: error.message }, 401);
+    }
+
+    // Handle Super Admin
+    if (data.user.email === superAdminEmail) {
+      let shopData = await kv.get(`shop:${data.user.id}`);
+      if (!shopData) {
+        const superAdminShop = {
+          id: data.user.id,
+          shopName: "Super Admin",
+          ownerName: data.user.email,
+          email: data.user.email,
+          phone: "",
+          address: "",
+          role: Roles.SUPER_ADMIN,
+          createdAt: new Date().toISOString(),
+        };
+        await kv.set(`shop:${data.user.id}`, JSON.stringify(superAdminShop));
+        await kv.set(`products:${data.user.id}`, JSON.stringify([]));
+        await kv.set(`customers:${data.user.id}`, JSON.stringify([]));
+        await kv.set(`sales:${data.user.id}`, JSON.stringify([]));
+        await kv.set(`ledger:${data.user.id}`, JSON.stringify([]));
+        await kv.set(`users:${data.user.id}`, JSON.stringify([]));
+        shopData = JSON.stringify(superAdminShop);
+      }
+      return c.json({
+        accessToken: data.session.access_token,
+        user: data.user,
+        shop: JSON.parse(shopData),
+      });
+    }
+    
+    // Check if this is a team member (Manager/Salesman)
+    const userShopId = await kv.get(`user:shop:${data.user.id}`);
+    
+    if (userShopId) {
+      // This is a team member - get their shop
+      const shopData = await kv.get(`shop:${userShopId}`);
+      if (!shopData) {
+        return c.json({ error: "Shop not found for team member" }, 404);
+      }
+      
+      const shop = JSON.parse(shopData);
+      
+      // Get team member details to set their role
+      const usersData = await kv.get(`users:${userShopId}`);
+      const users = usersData ? JSON.parse(usersData) : [];
+      const teamMember = users.find((u: any) => u.id === data.user.id);
+      
+      if (!teamMember) {
+        return c.json({ error: "Team member not found" }, 404);
+      }
+      
+      // Create a shop object with the team member's role
+      const shopWithRole = {
+        ...shop,
+        role: teamMember.role, // Use team member's role (manager/salesman)
+        teamMemberName: teamMember.name,
+      };
+      
+      return c.json({
+        accessToken: data.session.access_token,
+        user: data.user,
+        shop: shopWithRole,
+      });
+    }
+    
+    // Handle Shop Owner (Admin)
+    const shopData = await kv.get(`shop:${data.user.id}`);
+    if (!shopData) {
+      const pendingData = await kv.get(`pending:${data.user.id}`);
+      if (pendingData) {
+        const pending = JSON.parse(pendingData);
+        return c.json({
+          error: `Your account is ${pending.status}. Please wait for admin approval.`,
+          isPending: true,
+          status: pending.status,
+        }, 403);
+      }
+      return c.json({ error: "Account not found" }, 404);
+    }
+    
+    return c.json({
+      accessToken: data.session.access_token,
+      user: data.user,
+      shop: JSON.parse(shopData),
+    });
+  } catch (err: any) {
+    return c.json({ error: "Failed to sign in" }, 500);
+  }
+});
+
+app.get("/make-server-a01dd888/auth/session", async (c) => {
+  try {
+    const auth = await getAuthenticatedShop(c.req.raw);
+    if ("error" in auth && !auth.isPending) {
+      return c.json({ session: null });
+    }
+
+    return c.json({
+      accessToken: c.req.header("Authorization")?.split(" ")[1],
+      user: auth.user,
+      shop: auth.shop,
+    });
+  } catch (error) {
+    console.log("Session check error:", error);
+    return c.json({ session: null });
+  }
+});
+
+app.post('/make-server-a01dd888/auth/signout', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1];
+    if (accessToken) {
+      await supabase.auth.admin.signOut(accessToken);
+    }
+    return c.json({ message: 'Signed out successfully' });
+  } catch (error) {
+    console.log('Signout error:', error);
+    return c.json({ error: 'Failed to sign out' }, 500);
+  }
+});
+
+// ==================== SHOP ROUTES ====================
+
+app.get('/make-server-a01dd888/shop', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  return c.json({ shop: auth.shop });
+});
+
+app.put('/make-server-a01dd888/shop', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const updates = await c.req.json();
+    const updatedShop = { ...auth.shop, ...updates };
+    await kv.set(`shop:${auth.shopId}`, JSON.stringify(updatedShop));
+    return c.json({ shop: updatedShop });
+  } catch (error) {
+    console.log('Shop update error:', error);
+    return c.json({ error: 'Failed to update shop' }, 500);
+  }
+});
+
+// ==================== PRODUCT ROUTES ====================
+
+app.get('/make-server-a01dd888/products', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const productsData = await kv.get(`products:${auth.shopId}`);
+  return c.json({ products: productsData ? JSON.parse(productsData) : [] });
+});
+
+app.post('/make-server-a01dd888/products', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const product = await c.req.json();
+    const productsData = await kv.get(`products:${auth.shopId}`);
+    const products = productsData ? JSON.parse(productsData) : [];
+    
+    const newProduct = { ...product, id: Date.now().toString() };
+    products.push(newProduct);
+    
+    await kv.set(`products:${auth.shopId}`, JSON.stringify(products));
+    return c.json({ product: newProduct });
+  } catch (error) {
+    console.log('Product creation error:', error);
+    return c.json({ error: 'Failed to create product' }, 500);
+  }
+});
+
+app.put('/make-server-a01dd888/products/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const productId = c.req.param('id');
+    const updates = await c.req.json();
+    
+    const productsData = await kv.get(`products:${auth.shopId}`);
+    const products = productsData ? JSON.parse(productsData) : [];
+    
+    const index = products.findIndex((p: any) => p.id === productId);
+    if (index === -1) {
+      return c.json({ error: 'Product not found' }, 404);
+    }
+    
+    products[index] = { ...products[index], ...updates };
+    await kv.set(`products:${auth.shopId}`, JSON.stringify(products));
+    
+    return c.json({ product: products[index] });
+  } catch (error) {
+    console.log('Product update error:', error);
+    return c.json({ error: 'Failed to update product' }, 500);
+  }
+});
+
+app.delete('/make-server-a01dd888/products/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const productId = c.req.param('id');
+    const productsData = await kv.get(`products:${auth.shopId}`);
+    const products = productsData ? JSON.parse(productsData) : [];
+    
+    const filtered = products.filter((p: any) => p.id !== productId);
+    await kv.set(`products:${auth.shopId}`, JSON.stringify(filtered));
+    
+    return c.json({ message: 'Product deleted' });
+  } catch (error) {
+    console.log('Product deletion error:', error);
+    return c.json({ error: 'Failed to delete product' }, 500);
+  }
+});
+
+// ==================== CUSTOMER ROUTES ====================
+
+app.get('/make-server-a01dd888/customers', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const customersData = await kv.get(`customers:${auth.shopId}`);
+  return c.json({ customers: customersData ? JSON.parse(customersData) : [] });
+});
+
+app.post('/make-server-a01dd888/customers', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const customer = await c.req.json();
+    const customersData = await kv.get(`customers:${auth.shopId}`);
+    const customers = customersData ? JSON.parse(customersData) : [];
+    
+    const newCustomer = { ...customer, id: Date.now().toString(), balance: 0 };
+    customers.push(newCustomer);
+    
+    await kv.set(`customers:${auth.shopId}`, JSON.stringify(customers));
+    return c.json({ customer: newCustomer });
+  } catch (error) {
+    console.log('Customer creation error:', error);
+    return c.json({ error: 'Failed to create customer' }, 500);
+  }
+});
+
+app.put('/make-server-a01dd888/customers/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const customerId = c.req.param('id');
+    const updates = await c.req.json();
+    
+    const customersData = await kv.get(`customers:${auth.shopId}`);
+    const customers = customersData ? JSON.parse(customersData) : [];
+    
+    const index = customers.findIndex((c: any) => c.id === customerId);
+    if (index === -1) {
+      return c.json({ error: 'Customer not found' }, 404);
+    }
+    
+    customers[index] = { ...customers[index], ...updates };
+    await kv.set(`customers:${auth.shopId}`, JSON.stringify(customers));
+    
+    return c.json({ customer: customers[index] });
+  } catch (error) {
+    console.log('Customer update error:', error);
+    return c.json({ error: 'Failed to update customer' }, 500);
+  }
+});
+
+app.delete('/make-server-a01dd888/customers/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const customerId = c.req.param('id');
+    const customersData = await kv.get(`customers:${auth.shopId}`);
+    const customers = customersData ? JSON.parse(customersData) : [];
+    
+    const filtered = customers.filter((c: any) => c.id !== customerId);
+    await kv.set(`customers:${auth.shopId}`, JSON.stringify(filtered));
+    
+    return c.json({ message: 'Customer deleted' });
+  } catch (error) {
+    console.log('Customer deletion error:', error);
+    return c.json({ error: 'Failed to delete customer' }, 500);
+  }
+});
+
+// ==================== SALES ROUTES ====================
+
+app.get('/make-server-a01dd888/sales', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const salesData = await kv.get(`sales:${auth.shopId}`);
+  return c.json({ sales: salesData ? JSON.parse(salesData) : [] });
+});
+
+app.post('/make-server-a01dd888/sales', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const sale = await c.req.json();
+    
+    // Get all related data
+    const salesData = await kv.get(`sales:${auth.shopId}`);
+    const sales = salesData ? JSON.parse(salesData) : [];
+    
+    const productsData = await kv.get(`products:${auth.shopId}`);
+    const products = productsData ? JSON.parse(productsData) : [];
+    
+    const customersData = await kv.get(`customers:${auth.shopId}`);
+    const customers = customersData ? JSON.parse(customersData) : [];
+    
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    
+    // ✅ ADD THIS: Validate stock availability for all items
+    for (const item of sale.items) {
+      const product = products.find((p: any) => p.id === item.productId);
+      if (!product) {
+        return c.json({ error: `Product not found: ${item.productName}` }, 400);
+      }
+      if (product.stock < item.quantity) {
+        return c.json({ 
+          error: `Insufficient stock for ${product.name}. Available: ${product.stock}, Requested: ${item.quantity}` 
+        }, 400);
+      }
+    }
+    
+    // Create new sale
+    const newSale = {
+      ...sale,
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+    };
+    sales.unshift(newSale);
+    
+    // Update product stock
+    sale.items.forEach((item: any) => {
+      const productIndex = products.findIndex((p: any) => p.id === item.productId);
+      if (productIndex !== -1) {
+        products[productIndex].stock -= item.quantity;
+      }
+    });
+    
+    // Update customer balance if credit sale
+    if (sale.paymentMethod === 'credit' && sale.balance > 0) {
+      const customerIndex = customers.findIndex((c: any) => c.id === sale.customerId);
+      if (customerIndex !== -1) {
+        customers[customerIndex].balance += sale.balance;
+      }
+    }
+    
+    // Add ledger entry
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+    const newLedgerEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'sale',
+      customerId: sale.customerId,
+      customerName: sale.customerName,
+      description: `Sale Invoice #${newSale.id.slice(-6)}`,
+      debit: 0,
+      credit: sale.amountPaid,
+      balance: currentBalance + sale.amountPaid,
+    };
+    ledger.unshift(newLedgerEntry);
+    
+    // Save all updates
+    await kv.set(`sales:${auth.shopId}`, JSON.stringify(sales));
+    await kv.set(`products:${auth.shopId}`, JSON.stringify(products));
+    await kv.set(`customers:${auth.shopId}`, JSON.stringify(customers));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+    
+    return c.json({ sale: newSale });
+  } catch (error) {
+    console.log('Sale creation error:', error);
+    return c.json({ error: 'Failed to create sale' }, 500);
+  }
+});
+
+// ==================== LEDGER ROUTES ====================
+
+app.get('/make-server-a01dd888/ledger', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+  return c.json({ ledger: ledgerData ? JSON.parse(ledgerData) : [] });
+});
+
+app.post('/make-server-a01dd888/ledger/entry', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const entry = await c.req.json();
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+    const newEntry = {
+      ...entry,
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      balance: currentBalance + entry.credit - entry.debit,
+    };
+    
+    ledger.unshift(newEntry);
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+    
+    return c.json({ entry: newEntry });
+  } catch (error) {
+    console.log('Ledger entry creation error:', error);
+    return c.json({ error: 'Failed to create ledger entry' }, 500);
+  }
+});
+
+app.post('/make-server-a01dd888/ledger/payment', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const { customerId, amount, description } = await c.req.json();
+    
+    const customersData = await kv.get(`customers:${auth.shopId}`);
+    const customers = customersData ? JSON.parse(customersData) : [];
+    
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    
+    const customerIndex = customers.findIndex((c: any) => c.id === customerId);
+    if (customerIndex === -1) {
+      return c.json({ error: 'Customer not found' }, 404);
+    }
+    
+    // Update customer balance
+    customers[customerIndex].balance -= amount;
+    
+    // Add ledger entry
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+    const newEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'payment',
+      customerId,
+      customerName: customers[customerIndex].name,
+      description: description || `Payment received from ${customers[customerIndex].name}`,
+      debit: 0,
+      credit: amount,
+      balance: currentBalance + amount,
+    };
+    
+    ledger.unshift(newEntry);
+    
+    await kv.set(`customers:${auth.shopId}`, JSON.stringify(customers));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+    
+    return c.json({ entry: newEntry, customer: customers[customerIndex] });
+  } catch (error) {
+    console.log('Payment recording error:', error);
+    return c.json({ error: 'Failed to record payment' }, 500);
+  }
+});
+
+// ==================== ADMIN APPROVAL ROUTES ====================
+
+// Get all pending approval requests (Super Admin Only)
+app.get('/make-server-a01dd888/admin/pending-approvals', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    console.log('Admin pending-approvals auth error:', auth.error);
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is super admin
+  console.log('Checking super admin access. Shop email:', auth.shop.email, 'Shop role:', auth.shop.role, 'SUPER_ADMIN_EMAIL:', superAdminEmail);
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    console.log('Access denied. Not a super admin.');
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const pendingListData = await kv.get('pending:list');
+    console.log('Pending list data:', pendingListData);
+    const pendingList = pendingListData ? JSON.parse(pendingListData) : [];
+    console.log('Pending list:', pendingList);
+    
+    const requests = [];
+    for (const userId of pendingList) {
+      const requestData = await kv.get(`pending:${userId}`);
+      console.log(`Pending request for ${userId}:`, requestData);
+      if (requestData) {
+        requests.push(JSON.parse(requestData));
+      }
+    }
+    
+    console.log('Total pending requests found:', requests.length);
+    return c.json({ pendingRequests: requests });
+  } catch (error) {
+    console.log('Get pending approvals error:', error);
+    return c.json({ error: 'Failed to get pending approvals' }, 500);
+  }
+});
+
+// Approve shop registration (Super Admin Only)
+app.post('/make-server-a01dd888/admin/approve/:userId', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is super admin
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const userId = c.req.param('userId');
+    const { paymentConfirmed } = await c.req.json();
+
+    if (!paymentConfirmed) {
+      return c.json({ error: 'Payment confirmation required' }, 400);
+    }
+
+    // Get pending request
+    const pendingData = await kv.get(`pending:${userId}`);
+    if (!pendingData) {
+      return c.json({ error: 'Pending request not found' }, 404);
+    }
+
+    const pendingRequest = JSON.parse(pendingData);
+
+    // Create shop record
+    const shop = {
+      id: userId,
+      shopName: pendingRequest.shopName,
+      ownerName: pendingRequest.ownerName,
+      email: pendingRequest.email,
+      phone: pendingRequest.phone,
+      address: pendingRequest.address,
+      role: Roles.ADMIN,
+      status: 'active',
+      createdAt: pendingRequest.createdAt,
+      approvedAt: new Date().toISOString(),
+      approvedBy: auth.user.id,
+      subscriptionEndDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+
+    await kv.set(`shop:${userId}`, JSON.stringify(shop));
+
+    // Initialize empty data for the shop
+    await kv.set(`products:${userId}`, JSON.stringify([]));
+    await kv.set(`customers:${userId}`, JSON.stringify([]));
+    await kv.set(`sales:${userId}`, JSON.stringify([]));
+    await kv.set(`ledger:${userId}`, JSON.stringify([]));
+    await kv.set(`users:${userId}`, JSON.stringify([])); // For team members
+
+    // Update pending status
+    pendingRequest.status = APPROVAL_STATUS.APPROVED;
+    pendingRequest.approvedAt = shop.approvedAt;
+    pendingRequest.approvedBy = auth.user.id;
+    await kv.set(`pending:${userId}`, JSON.stringify(pendingRequest));
+
+    // Remove from pending list
+    const pendingListData = await kv.get('pending:list');
+    const pendingList = pendingListData ? JSON.parse(pendingListData) : [];
+    const updatedList = pendingList.filter((id: string) => id !== userId);
+    await kv.set('pending:list', JSON.stringify(updatedList));
+
+    return c.json({ 
+      message: 'Shop approved successfully',
+      shop,
+    });
+  } catch (error) {
+    console.log('Approval error:', error);
+    return c.json({ error: 'Failed to approve shop' }, 500);
+  }
+});
+
+// Reject shop registration (Super Admin Only)
+app.post('/make-server-a01dd888/admin/reject/:userId', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is super admin
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const userId = c.req.param('userId');
+    const { reason } = await c.req.json();
+
+    // Get pending request
+    const pendingData = await kv.get(`pending:${userId}`);
+    if (!pendingData) {
+      return c.json({ error: 'Pending request not found' }, 404);
+    }
+
+    const pendingRequest = JSON.parse(pendingData);
+    pendingRequest.status = APPROVAL_STATUS.REJECTED;
+    pendingRequest.rejectedAt = new Date().toISOString();
+    pendingRequest.rejectedBy = auth.user.id;
+    pendingRequest.rejectionReason = reason;
+
+    await kv.set(`pending:${userId}`, JSON.stringify(pendingRequest));
+
+    // Remove from pending list
+    const pendingListData = await kv.get('pending:list');
+    const pendingList = pendingListData ? JSON.parse(pendingListData) : [];
+    const updatedList = pendingList.filter((id: string) => id !== userId);
+    await kv.set('pending:list', JSON.stringify(updatedList));
+
+    return c.json({ message: 'Shop registration rejected' });
+  } catch (error) {
+    console.log('Rejection error:', error);
+    return c.json({ error: 'Failed to reject shop' }, 500);
+  }
+});
+// Get all approved shops (Super Admin Only)
+app.get('/make-server-a01dd888/admin/approved-shops', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const { data: shops, error } = await supabase
+      .from('POS')
+      .select('*')
+      .like('key', 'shop:%');
+
+    if (error) throw error;
+
+    const approvedShops = shops
+      .map(item => {
+        try {
+          const shop = JSON.parse(item.value);
+          return { ...shop, id: item.key.replace('shop:', '') };
+        } catch {
+          return null;
+        }
+      })
+      .filter(shop => shop && shop.approvedAt && shop.role !== Roles.SUPER_ADMIN);
+
+    return c.json({ approvedShops });
+  } catch (error) {
+    console.log('Get approved shops error:', error);
+    return c.json({ error: 'Failed to get approved shops' }, 500);
+  }
+});
+
+// Update shop status (Super Admin Only)
+app.put('/make-server-a01dd888/admin/shop/:shopId/status', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const shopId = c.req.param('shopId');
+    const { status } = await c.req.json();
+
+    const shopData = await kv.get(`shop:${shopId}`);
+    if (!shopData) {
+      return c.json({ error: 'Shop not found' }, 404);
+    }
+
+    const shop = JSON.parse(shopData);
+    shop.status = status;
+    
+    if (status === 'inactive') {
+      shop.lastSuspendedAt = new Date().toISOString();
+    } else if (status === 'active') {
+      shop.lastReactivatedAt = new Date().toISOString();
+    }
+
+    await kv.set(`shop:${shopId}`, JSON.stringify(shop));
+
+    return c.json({ message: 'Shop status updated', shop });
+  } catch (error) {
+    console.log('Update shop status error:', error);
+    return c.json({ error: 'Failed to update shop status' }, 500);
+  }
+});
+
+// Extend subscription (Super Admin Only)
+app.post('/make-server-a01dd888/admin/shop/:shopId/extend-subscription', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  if (auth.shop.email !== superAdminEmail && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Super admin access required.' }, 403);
+  }
+
+  try {
+    const shopId = c.req.param('shopId');
+    const { months } = await c.req.json();
+
+    const shopData = await kv.get(`shop:${shopId}`);
+    if (!shopData) {
+      return c.json({ error: 'Shop not found' }, 404);
+    }
+
+    const shop = JSON.parse(shopData);
+    
+    const currentEndDate = shop.subscriptionEndDate 
+      ? new Date(shop.subscriptionEndDate) 
+      : new Date();
+    
+    const now = new Date();
+    const startDate = currentEndDate > now ? currentEndDate : now;
+    
+    startDate.setMonth(startDate.getMonth() + months);
+    shop.subscriptionEndDate = startDate.toISOString();
+
+    await kv.set(`shop:${shopId}`, JSON.stringify(shop));
+
+    return c.json({ message: 'Subscription extended', shop });
+  } catch (error) {
+    console.log('Extend subscription error:', error);
+    return c.json({ error: 'Failed to extend subscription' }, 500);
+  }
+});
+// ==================== USER MANAGEMENT ROUTES (Admin can create Manager/Salesman) ====================
+
+// Get all users in shop
+app.get('/make-server-a01dd888/users', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const usersData = await kv.get(`users:${auth.shopId}`);
+    const users = usersData ? JSON.parse(usersData) : [];
+    
+    // Add shop owner as first user
+    const allUsers = [
+      {
+        id: auth.shopId,
+        name: auth.shop.ownerName,
+        email: auth.shop.email,
+        role: auth.shop.role,
+        isOwner: true,
+      },
+      ...users,
+    ];
+    
+    return c.json({ users: allUsers });
+  } catch (error) {
+    console.log('Get users error:', error);
+    return c.json({ error: 'Failed to get users' }, 500);
+  }
+});
+
+// Create new user (Manager or Salesman) - Admin only
+app.post('/make-server-a01dd888/users', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is admin
+  if (auth.shop.role !== Roles.ADMIN && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Admin access required.' }, 403);
+  }
+
+  try {
+    const { email, password, name, role, phone } = await c.req.json();
+
+    if (!email || !password || !name || !role) {
+      return c.json({ error: 'Missing required fields' }, 400);
+    }
+
+    if (role !== Roles.MANAGER && role !== Roles.SALES_MAN) {
+      return c.json({ error: 'Invalid role. Can only create Manager or Salesman' }, 400);
+    }
+
+    // Create Supabase user
+    const { data: authData, error: authError } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { 
+        shopId: auth.shopId,
+        shopName: auth.shop.shopName,
+        name,
+        role,
+      },
+    });
+
+    if (authError) {
+      console.log('User creation error:', authError);
+      return c.json({ error: authError.message }, 400);
+    }
+
+    const newUserId = authData.user.id;
+
+    // Create user record
+    const newUser = {
+      id: newUserId,
+      shopId: auth.shopId,
+      name,
+      email,
+      phone: phone || '',
+      role,
+      createdAt: new Date().toISOString(),
+      createdBy: auth.user.id,
+    };
+
+    // Add to shop's users list
+    const usersData = await kv.get(`users:${auth.shopId}`);
+    const users = usersData ? JSON.parse(usersData) : [];
+    users.push(newUser);
+    await kv.set(`users:${auth.shopId}`, JSON.stringify(users));
+
+    // Store user's shop association
+    await kv.set(`user:shop:${newUserId}`, auth.shopId);
+
+    return c.json({ 
+      message: 'User created successfully',
+      user: newUser,
+    });
+  } catch (error) {
+    console.log('User creation error:', error);
+    return c.json({ error: 'Failed to create user' }, 500);
+  }
+});
+
+// Update user role
+app.put('/make-server-a01dd888/users/:userId/role', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is admin
+  if (auth.shop.role !== Roles.ADMIN && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Admin access required.' }, 403);
+  }
+
+  try {
+    const userId = c.req.param('userId');
+    const { role } = await c.req.json();
+
+    if (role !== Roles.MANAGER && role !== Roles.SALES_MAN) {
+      return c.json({ error: 'Invalid role' }, 400);
+    }
+
+    const usersData = await kv.get(`users:${auth.shopId}`);
+    const users = usersData ? JSON.parse(usersData) : [];
+    
+    const userIndex = users.findIndex((u: any) => u.id === userId);
+    if (userIndex === -1) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    users[userIndex].role = role;
+    await kv.set(`users:${auth.shopId}`, JSON.stringify(users));
+
+    return c.json({ 
+      message: 'User role updated',
+      user: users[userIndex],
+    });
+  } catch (error) {
+    console.log('Update user role error:', error);
+    return c.json({ error: 'Failed to update user role' }, 500);
+  }
+});
+
+// Delete user
+app.delete('/make-server-a01dd888/users/:userId', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  // Check if user is admin
+  if (auth.shop.role !== Roles.ADMIN && auth.shop.role !== Roles.SUPER_ADMIN) {
+    return c.json({ error: 'Unauthorized. Admin access required.' }, 403);
+  }
+
+  try {
+    const userId = c.req.param('userId');
+
+    // Cannot delete yourself
+    if (userId === auth.user.id) {
+      return c.json({ error: 'Cannot delete your own account' }, 400);
+    }
+
+    const usersData = await kv.get(`users:${auth.shopId}`);
+    const users = usersData ? JSON.parse(usersData) : [];
+    
+    const filtered = users.filter((u: any) => u.id !== userId);
+    await kv.set(`users:${auth.shopId}`, JSON.stringify(filtered));
+
+    // Delete user from Supabase
+    await supabase.auth.admin.deleteUser(userId);
+
+    // Remove shop association
+    await kv.del(`user:shop:${userId}`);
+
+    return c.json({ message: 'User deleted successfully' });
+  } catch (error) {
+    console.log('Delete user error:', error);
+    return c.json({ error: 'Failed to delete user' }, 500);
+  }
+});
+
+
+
+// ==================== SUPPLIER ROUTES ====================
+
+app.get('/make-server-a01dd888/suppliers', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+  return c.json({ suppliers: suppliersData ? JSON.parse(suppliersData) : [] });
+});
+
+app.post('/make-server-a01dd888/suppliers', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const supplier = await c.req.json();
+    const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+    const suppliers = suppliersData ? JSON.parse(suppliersData) : [];
+    
+    const newSupplier = { 
+      ...supplier, 
+      id: Date.now().toString(),
+      balance: 0,
+      createdAt: new Date().toISOString()
+    };
+    suppliers.push(newSupplier);
+    
+    await kv.set(`suppliers:${auth.shopId}`, JSON.stringify(suppliers));
+    return c.json({ supplier: newSupplier });
+  } catch (error) {
+    console.log('Supplier creation error:', error);
+    return c.json({ error: 'Failed to create supplier' }, 500);
+  }
+});
+
+app.put('/make-server-a01dd888/suppliers/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const supplierId = c.req.param('id');
+    const updates = await c.req.json();
+    
+    const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+    const suppliers = suppliersData ? JSON.parse(suppliersData) : [];
+    
+    const index = suppliers.findIndex((s: any) => s.id === supplierId);
+    if (index === -1) {
+      return c.json({ error: 'Supplier not found' }, 404);
+    }
+    
+    suppliers[index] = { ...suppliers[index], ...updates };
+    await kv.set(`suppliers:${auth.shopId}`, JSON.stringify(suppliers));
+    
+    return c.json({ supplier: suppliers[index] });
+  } catch (error) {
+    console.log('Supplier update error:', error);
+    return c.json({ error: 'Failed to update supplier' }, 500);
+  }
+});
+
+app.delete('/make-server-a01dd888/suppliers/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const supplierId = c.req.param('id');
+    const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+    const suppliers = suppliersData ? JSON.parse(suppliersData) : [];
+    
+    const filtered = suppliers.filter((s: any) => s.id !== supplierId);
+    await kv.set(`suppliers:${auth.shopId}`, JSON.stringify(filtered));
+    
+    return c.json({ message: 'Supplier deleted' });
+  } catch (error) {
+    console.log('Supplier deletion error:', error);
+    return c.json({ error: 'Failed to delete supplier' }, 500);
+  }
+});
+
+// ==================== PURCHASE ORDER ROUTES ====================
+
+app.get('/make-server-a01dd888/purchases', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  const purchasesData = await kv.get(`purchases:${auth.shopId}`);
+  return c.json({ purchases: purchasesData ? JSON.parse(purchasesData) : [] });
+});
+
+app.post('/make-server-a01dd888/purchases', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const purchase = await c.req.json();
+    
+    // Get all related data
+    const purchasesData = await kv.get(`purchases:${auth.shopId}`);
+    const purchases = purchasesData ? JSON.parse(purchasesData) : [];
+    
+    const productsData = await kv.get(`products:${auth.shopId}`);
+    const products = productsData ? JSON.parse(productsData) : [];
+    
+    const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+    const suppliers = suppliersData ? JSON.parse(suppliersData) : [];
+    
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    
+    // Create new purchase
+    const newPurchase = {
+      ...purchase,
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+    };
+    purchases.unshift(newPurchase);
+    
+    // Update product stock (INCREASE)
+    // Update product stock AND cost price (INCREASE)
+purchase.items.forEach((item: any) => {
+  const productIndex = products.findIndex((p: any) => p.id === item.productId);
+  if (productIndex !== -1) {
+    products[productIndex].stock += item.quantity;
+    products[productIndex].costPrice = item.price; // ADD THIS LINE - Save the buying price
+  }
+});
+    
+    // Update supplier balance if credit purchase
+    if (purchase.paymentMethod === 'credit' && purchase.balance > 0) {
+      const supplierIndex = suppliers.findIndex((s: any) => s.id === purchase.supplierId);
+      if (supplierIndex !== -1) {
+        suppliers[supplierIndex].balance += purchase.balance;
+      }
+    }
+    
+    // Add ledger entry (DEBIT - money out)
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+    const newLedgerEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'purchase',
+      supplierId: purchase.supplierId,
+      supplierName: purchase.supplierName,
+      description: `Purchase Order #${newPurchase.id.slice(-6)}`,
+      debit: purchase.amountPaid,
+      credit: 0,
+      balance: currentBalance - purchase.amountPaid,
+    };
+    ledger.unshift(newLedgerEntry);
+    
+    // Save all updates
+    await kv.set(`purchases:${auth.shopId}`, JSON.stringify(purchases));
+    await kv.set(`products:${auth.shopId}`, JSON.stringify(products));
+    await kv.set(`suppliers:${auth.shopId}`, JSON.stringify(suppliers));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+    
+    return c.json({ purchase: newPurchase });
+  } catch (error) {
+    console.log('Purchase creation error:', error);
+    return c.json({ error: 'Failed to create purchase' }, 500);
+  }
+});
+
+// Supplier payment route
+app.post('/make-server-a01dd888/ledger/supplier-payment', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) {
+    return c.json({ error: auth.error }, auth.status);
+  }
+
+  try {
+    const { supplierId, amount, description } = await c.req.json();
+    
+    const suppliersData = await kv.get(`suppliers:${auth.shopId}`);
+    const suppliers = suppliersData ? JSON.parse(suppliersData) : [];
+    
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    
+    const supplierIndex = suppliers.findIndex((s: any) => s.id === supplierId);
+    if (supplierIndex === -1) {
+      return c.json({ error: 'Supplier not found' }, 404);
+    }
+    
+    // Update supplier balance
+    suppliers[supplierIndex].balance -= amount;
+    
+    // Add ledger entry
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+    const newEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'supplier_payment',
+      supplierId,
+      supplierName: suppliers[supplierIndex].name,
+      description: description || `Payment to ${suppliers[supplierIndex].name}`,
+      debit: amount,
+      credit: 0,
+      balance: currentBalance - amount,
+    };
+    
+    ledger.unshift(newEntry);
+    
+    await kv.set(`suppliers:${auth.shopId}`, JSON.stringify(suppliers));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+    
+    return c.json({ entry: newEntry, supplier: suppliers[supplierIndex] });
+  } catch (error) {
+    console.log('Supplier payment error:', error);
+    return c.json({ error: 'Failed to record payment' }, 500);
+  }
+});
+
+
+//26/01/26
+// ==================== CHART OF ACCOUNTS ROUTES ====================
+
+// GET: Fetch all accounts for the shop
+app.get('/make-server-a01dd888/accounts', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const accountsData = await kv.get(`accounts:${auth.shopId}`);
+    const accounts = accountsData ? JSON.parse(accountsData) : [];
+    return c.json(accounts);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch accounts' }, 500);
+  }
+});
+
+// POST: Create a new account
+app.post('/make-server-a01dd888/accounts', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const account = await c.req.json();
+    const accountsData = await kv.get(`accounts:${auth.shopId}`);
+    const accounts = accountsData ? JSON.parse(accountsData) : [];
+    
+    const newAccount = {
+      ...account,
+      id: crypto.randomUUID(),
+      balance: account.balance || 0,
+      createdAt: new Date().toISOString()
+    };
+    
+    accounts.push(newAccount);
+    await kv.set(`accounts:${auth.shopId}`, JSON.stringify(accounts));
+    return c.json(newAccount);
+  } catch (error) {
+    return c.json({ error: 'Failed to create account' }, 500);
+  }
+});
+
+// ==================== TRANSACTION ROUTES ====================
+
+// GET: Fetch all transactions for the shop (The missing route!)
+app.get('/make-server-a01dd888/transactions', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const txnsData = await kv.get(`transactions:${auth.shopId}`);
+    const transactions = txnsData ? JSON.parse(txnsData) : [];
+    return c.json(transactions);
+  } catch (error) {
+    return c.json({ error: 'Failed to fetch transactions' }, 500);
+  }
+});
+
+// GET: Transactions for a specific account
+app.get('/make-server-a01dd888/transactions/:accountId', async (c) => {
+  const accountId = c.req.param('accountId');
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+  
+  const allTxnsData = await kv.get(`transactions:${auth.shopId}`);
+  const allTxns = allTxnsData ? JSON.parse(allTxnsData) : [];
+  
+  const accountTxns = allTxns.filter((t: any) => 
+    t.debitAccountId === accountId || t.creditAccountId === accountId
+  );
+
+  return c.json(accountTxns);
+});
+
+// POST: Record a double-entry transaction
+app.post('/make-server-a01dd888/transactions', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const body = await c.req.json();
+    const { debitAccountId, creditAccountId, amount, description, date, reference } = body;
+
+    const accountsData = await kv.get(`accounts:${auth.shopId}`);
+    let accounts = accountsData ? JSON.parse(accountsData) : [];
+
+    // Double Entry Logic: Debit increases asset/expense, Credit decreases asset/revenue
+    accounts = accounts.map((acc: any) => {
+      if (acc.id === debitAccountId) {
+        return { ...acc, balance: (acc.balance || 0) + Number(amount) };
+      }
+      if (acc.id === creditAccountId) {
+        return { ...acc, balance: (acc.balance || 0) - Number(amount) };
+      }
+      return acc;
+    });
+
+    const newTransaction = {
+      id: crypto.randomUUID(),
+      shopId: auth.shopId,
+      date,
+      description,
+      debitAccountId,
+      creditAccountId,
+      amount: Number(amount),
+      reference,
+      createdAt: new Date().toISOString()
+    };
+
+    const txnsData = await kv.get(`transactions:${auth.shopId}`);
+    const transactions = txnsData ? JSON.parse(txnsData) : [];
+    transactions.unshift(newTransaction);
+
+    await kv.set(`accounts:${auth.shopId}`, JSON.stringify(accounts));
+    await kv.set(`transactions:${auth.shopId}`, JSON.stringify(transactions));
+
+    return c.json({ success: true, transaction: newTransaction });
+  } catch (error) {
+    console.error('Transaction Error:', error);
+    return c.json({ error: 'Failed to process transaction' }, 500);
+  }
+});
+
+// ==================== TRIAL BALANCE ROUTES ====================
+
+app.get('/make-server-a01dd888/trial-balance', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const accountsData = await kv.get(`accounts:${auth.shopId}`);
+    const accounts = accountsData ? JSON.parse(accountsData) : [];
+
+    const assets = accounts.filter((acc: any) => acc.category === 'Assets');
+    const liabilities = accounts.filter((acc: any) => acc.category === 'Liabilities');
+
+    const totalAssets = assets.reduce((sum: number, acc: any) => sum + (acc.balance || 0), 0);
+    const totalLiabilities = liabilities.reduce((sum: number, acc: any) => sum + (acc.balance || 0), 0);
+
+    return c.json({
+      summary: {
+        totalAssets,
+        totalLiabilities,
+        netWorth: totalAssets - totalLiabilities,
+      },
+      accounts: {
+        all: accounts,
+        byType: {
+          bank: accounts.filter((acc: any) => acc.type === 'bank'),
+          cash: accounts.filter((acc: any) => acc.type === 'cash'),
+          receivables: accounts.filter((acc: any) => acc.type === 'receivable'),
+          payables: accounts.filter((acc: any) => acc.type === 'payable'),
+        },
+      },
+    });
+  } catch (error) {
+    return c.json({ error: 'Failed to generate trial balance' }, 500);
+  }
+});
+// ==================== BANK ROUTES ====================
+
+// Get all banks
+app.get('/make-server-a01dd888/banks', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  const banksData = await kv.get(`banks:${auth.shopId}`);
+  return c.json({ banks: banksData ? JSON.parse(banksData) : [] });
+});
+
+// Create a new bank
+app.post('/make-server-a01dd888/banks', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const bank = await c.req.json();
+    const banksData = await kv.get(`banks:${auth.shopId}`);
+    const banks = banksData ? JSON.parse(banksData) : [];
+
+    const newBank = {
+      ...bank,
+      id: Date.now().toString(),
+      balance: 0,
+      createdAt: new Date().toISOString(),
+    };
+    banks.push(newBank);
+
+    await kv.set(`banks:${auth.shopId}`, JSON.stringify(banks));
+    return c.json({ bank: newBank });
+  } catch (error) {
+    console.log('Bank creation error:', error);
+    return c.json({ error: 'Failed to create bank' }, 500);
+  }
+});
+
+// Update bank
+app.put('/make-server-a01dd888/banks/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const bankId = c.req.param('id');
+    const updates = await c.req.json();
+
+    const banksData = await kv.get(`banks:${auth.shopId}`);
+    const banks = banksData ? JSON.parse(banksData) : [];
+
+    const index = banks.findIndex((b: any) => b.id === bankId);
+    if (index === -1) return c.json({ error: 'Bank not found' }, 404);
+
+    banks[index] = { ...banks[index], ...updates };
+    await kv.set(`banks:${auth.shopId}`, JSON.stringify(banks));
+
+    return c.json({ bank: banks[index] });
+  } catch (error) {
+    console.log('Bank update error:', error);
+    return c.json({ error: 'Failed to update bank' }, 500);
+  }
+});
+
+// Delete bank
+app.delete('/make-server-a01dd888/banks/:id', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const bankId = c.req.param('id');
+    const banksData = await kv.get(`banks:${auth.shopId}`);
+    const banks = banksData ? JSON.parse(banksData) : [];
+
+    const filtered = banks.filter((b: any) => b.id !== bankId);
+    await kv.set(`banks:${auth.shopId}`, JSON.stringify(filtered));
+
+    return c.json({ message: 'Bank deleted' });
+  } catch (error) {
+    console.log('Bank deletion error:', error);
+    return c.json({ error: 'Failed to delete bank' }, 500);
+  }
+});
+
+// ==================== BANK TRANSACTIONS ====================
+
+// Deposit into bank
+app.post('/make-server-a01dd888/banks/:id/deposit', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const bankId = c.req.param('id');
+    const { amount, description } = await c.req.json();
+
+    const banksData = await kv.get(`banks:${auth.shopId}`);
+    const banks = banksData ? JSON.parse(banksData) : [];
+
+    const index = banks.findIndex((b: any) => b.id === bankId);
+    if (index === -1) return c.json({ error: 'Bank not found' }, 404);
+
+    banks[index].balance += amount;
+
+    // Ledger entry
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+
+    const newEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'bank_deposit',
+      bankId,
+      bankName: banks[index].name,
+      description: description || `Deposit to ${banks[index].name}`,
+      debit: 0,
+      credit: amount,
+      balance: currentBalance + amount,
+    };
+    ledger.unshift(newEntry);
+
+    await kv.set(`banks:${auth.shopId}`, JSON.stringify(banks));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+
+    return c.json({ bank: banks[index], entry: newEntry });
+  } catch (error) {
+    console.log('Bank deposit error:', error);
+    return c.json({ error: 'Failed to deposit' }, 500);
+  }
+});
+
+// Withdraw from bank
+app.post('/make-server-a01dd888/banks/:id/withdraw', async (c) => {
+  const auth = await getAuthenticatedShop(c.req.raw);
+  if ('error' in auth) return c.json({ error: auth.error }, auth.status);
+
+  try {
+    const bankId = c.req.param('id');
+    const { amount, description } = await c.req.json();
+
+    const banksData = await kv.get(`banks:${auth.shopId}`);
+    const banks = banksData ? JSON.parse(banksData) : [];
+
+    const index = banks.findIndex((b: any) => b.id === bankId);
+    if (index === -1) return c.json({ error: 'Bank not found' }, 404);
+
+    if (banks[index].balance < amount) {
+      return c.json({ error: 'Insufficient bank balance' }, 400);
+    }
+
+    banks[index].balance -= amount;
+
+    // Ledger entry
+    const ledgerData = await kv.get(`ledger:${auth.shopId}`);
+    const ledger = ledgerData ? JSON.parse(ledgerData) : [];
+    const currentBalance = ledger.length > 0 ? ledger[0].balance : 0;
+
+    const newEntry = {
+      id: Date.now().toString(),
+      date: new Date().toISOString(),
+      type: 'bank_withdraw',
+      bankId,
+      bankName: banks[index].name,
+      description: description || `Withdrawal from ${banks[index].name}`,
+      debit: amount,
+      credit: 0,
+      balance: currentBalance - amount,
+    };
+    ledger.unshift(newEntry);
+
+    await kv.set(`banks:${auth.shopId}`, JSON.stringify(banks));
+    await kv.set(`ledger:${auth.shopId}`, JSON.stringify(ledger));
+
+    return c.json({ bank: banks[index], entry: newEntry });
+  } catch (error) {
+    console.log('Bank withdraw error:', error);
+    return c.json({ error: 'Failed to withdraw' }, 500);
+  }
+});
+
+serve(app.fetch)
